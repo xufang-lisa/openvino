@@ -249,4 +249,23 @@ enum ColumnOfCPUMappingTable {
     CPU_MAP_TABLE_SIZE = 6     //!< Size of CPU mapping table
 };
 
+#define CPU_TABLE_PRINT(table_name, table, table_log)                 \
+    table_log = table_name;                                           \
+    table_log += " is {";                                             \
+    for (int i = 0; i < static_cast<int>(table.size()); i++) {        \
+        table_log += "{";                                             \
+        for (int j = 0; j < static_cast<int>(table[i].size()); j++) { \
+            table_log += std::to_string(table[i][j]);                 \
+            table_log += ",";                                         \
+        }                                                             \
+        if (!table[i].empty()) {                                      \
+            table_log.pop_back();                                     \
+        }                                                             \
+        table_log += "},";                                            \
+    }                                                                 \
+    if (!table.empty()) {                                             \
+        table_log.pop_back();                                         \
+    }                                                                 \
+    table_log += "}";
+
 }  // namespace ov

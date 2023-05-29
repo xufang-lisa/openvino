@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <numeric>
 #include <transformations/utils/utils.hpp>
+#include <openvino/util/log.hpp>
 
 #include "cpu_map_scheduling.hpp"
 #include "graph.h"
@@ -297,6 +298,10 @@ void get_num_streams(const int streams,
                                                                  config.perfHintsConfig.ovPerfHintNumRequests,
                                                                  model_prefer,
                                                                  proc_type_table);
+    std::string streams_log;
+    CPU_TABLE_PRINT("streams_info_table", executor_config._streams_info_table, streams_log)
+    OPENVINO_DEBUG << streams_log << "\n";
+
     executor_config._stream_core_ids = reserve_available_cpus(executor_config._streams_info_table);
     executor_config._threadsPerStream = executor_config._streams_info_table[0][THREADS_PER_STREAM];
     executor_config._streams = 0;

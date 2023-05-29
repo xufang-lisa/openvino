@@ -18,6 +18,7 @@
 #include "openvino/core/visibility.hpp"
 #include "streams_executor.hpp"
 #include "threading/ie_cpu_streams_info.hpp"
+#include "openvino/util/log.hpp"
 
 #ifdef __APPLE__
 #    include <sys/sysctl.h>
@@ -339,6 +340,16 @@ std::vector<std::vector<int>> reserve_available_cpus(const std::vector<std::vect
                             pre.insert(pre.end(), cur.begin(), cur.end());
                             return pre;
                         });
+
+
+    std::string proc_type_log;
+    CPU_TABLE_PRINT("proc_type_table", cpu._proc_type_table, proc_type_log)
+    OPENVINO_DEBUG << proc_type_log << "\n";
+
+    std::string cpu_mapping_log;
+    CPU_TABLE_PRINT("cpu_mapping_table", cpu._cpu_mapping_table, cpu_mapping_log)
+    OPENVINO_DEBUG << cpu_mapping_log << "\n";
+
 
     return flatten_stream_ids;
 }
