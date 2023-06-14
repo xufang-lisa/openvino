@@ -269,13 +269,13 @@ int get_model_prefer_threads(const int num_streams,
     return model_prefer;
 }
 
-void generate_stream_info(const int streams,
-                          const std::shared_ptr<ngraph::Function>& ngraphFunc,
-                          Config& config,
-                          int preferred_nthreads_per_stream) {
+std::vector<std::vector<int>> generate_stream_info(const int streams,
+                                                   const std::shared_ptr<ngraph::Function>& ngraphFunc,
+                                                   Config& config,
+                                                   std::vector<std::vector<int>>& orig_proc_type_table,
+                                                   int preferred_nthreads_per_stream) {
     int model_prefer_threads = preferred_nthreads_per_stream;
     InferenceEngine::IStreamsExecutor::Config& executor_config = config.streamExecutorConfig;
-    auto& orig_proc_type_table = executor_config._orig_proc_type_table;
     std::vector<std::vector<int>> proc_type_table =
         apply_scheduling_core_type(config.schedulingCoreType, orig_proc_type_table);
     proc_type_table = apply_hyper_threading(config.enableHyperThreading,
@@ -297,6 +297,7 @@ void generate_stream_info(const int streams,
                                                                  config.perfHintsConfig.ovPerfHintNumRequests,
                                                                  model_prefer_threads,
                                                                  proc_type_table);
+    return proc_type_table;
 }
 
 void get_num_streams(const int streams,
@@ -309,8 +310,7 @@ void get_num_streams(const int streams,
 
     std::vector<std::vector<int>> orig_proc_type_table = get_proc_type_table();
 
-    executor_config._orig_proc_type_table = orig_proc_type_table;
-    generate_stream_info(streams, ngraphFunc, config);
+    generate_stream_info(streams, ngraphFunc, config, orig_proc_type_table);
 
     executor_config._stream_core_ids = reserve_available_cpus(executor_config._streams_info_table);
     executor_config._threadsPerStream = executor_config._streams_info_table[0][THREADS_PER_STREAM];
