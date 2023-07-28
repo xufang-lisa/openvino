@@ -35,7 +35,7 @@ void get_cur_stream_info(const int stream_id,
     core_type = streams_info_table[stream_info_id][PROC_TYPE];
     numa_node_id = streams_info_table[stream_info_id][STREAM_NUMA_NODE_ID];
 
-#if defined(_WIN32) || defined(__APPLE__)
+#if defined(__APPLE__)
     cpu_reserve = false;
 #endif
     if (cpu_reserve) {
