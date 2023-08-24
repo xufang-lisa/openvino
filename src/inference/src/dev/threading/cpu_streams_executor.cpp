@@ -33,6 +33,7 @@ struct CPUStreamsExecutor::Impl {
             int _threadBindingStep = 0;
             int _offset = 0;
             int _cpuIdxOffset = 0;
+            int _numanodeId = 0;
             std::vector<int> _cpu_ids;
             Observer(custom::task_arena& arena,
                      CpuSet mask,
@@ -42,6 +43,7 @@ struct CPUStreamsExecutor::Impl {
                      const int threadBindingStep,
                      const int threadBindingOffset,
                      const int cpuIdxOffset = 0,
+                     const int numaNodeId = 0,
                      const std::vector<int> cpu_ids = {})
                 : custom::task_scheduler_observer(arena),
                   _mask{std::move(mask)},
@@ -49,6 +51,7 @@ struct CPUStreamsExecutor::Impl {
                   _threadBindingStep(threadBindingStep),
                   _offset{streamId * threadsPerStream + threadBindingOffset},
                   _cpuIdxOffset(cpuIdxOffset),
+                  _numanodeId(numaNodeId),
                   _cpu_ids(cpu_ids) {}
             void on_scheduler_entry(bool) override {
                 pin_thread_to_vacant_core(_offset + tbb::this_task_arena::current_thread_index(),
@@ -56,7 +59,8 @@ struct CPUStreamsExecutor::Impl {
                                           _ncpus,
                                           _mask,
                                           _cpu_ids,
-                                          _cpuIdxOffset);
+                                          _cpuIdxOffset,
+                                          _numanodeId);
             }
             void on_scheduler_exit(bool) override {
                 pin_current_thread_by_mask(_ncpus, _mask);
@@ -165,8 +169,16 @@ struct CPUStreamsExecutor::Impl {
                     CpuSet processMask;
                     int ncpus = 0;
                     std::tie(processMask, ncpus) = get_process_mask();
-                    _observer.reset(
-                        new Observer{*_taskArena, std::move(processMask), ncpus, 0, concurrency, 0, 0, 0, _cpu_ids});
+                    _observer.reset(new Observer{*_taskArena,
+                                                 std::move(processMask),
+                                                 ncpus,
+                                                 0,
+                                                 concurrency,
+                                                 0,
+                                                 0,
+                                                 0,
+                                                 _numaNodeId,
+                                                 _cpu_ids});
                     _observer->observe(true);
                 }
             }

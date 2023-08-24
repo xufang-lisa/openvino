@@ -58,7 +58,8 @@ bool pin_thread_to_vacant_core(int thrIdx,
                                int ncores,
                                const CpuSet& procMask,
                                const std::vector<int>& cpu_ids,
-                               int cpuIdxOffset) {
+                               int cpuIdxOffset,
+                               int numaNodeId) {
     if (procMask == nullptr)
         return false;
     const size_t size = CPU_ALLOC_SIZE(ncores);
@@ -127,8 +128,15 @@ bool pin_thread_to_vacant_core(int thrIdx,
                                int ncores,
                                const CpuSet& procMask,
                                const std::vector<int>& cpu_ids,
-                               int cpuIdxOffset) {
-    return 0 != SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(1) << cpu_ids[thrIdx]);
+                               int cpuIdxOffset,
+                               int numaNodeId) {
+    GROUP_AFFINITY group;
+    group.Group = numaNodeId;
+    group.Mask = DWORD_PTR(1) << cpu_ids[thrIdx];
+    group.Reserved[0] = 0;
+    group.Reserved[1] = 0;
+    group.Reserved[2] = 0;
+    return 0 != SetThreadGroupAffinity(GetCurrentThread(), &group, NULL);
 }
 bool pin_current_thread_by_mask(int ncores, const CpuSet& procMask) {
     return false;
