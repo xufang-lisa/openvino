@@ -139,7 +139,13 @@ bool pin_thread_to_vacant_core(int thrIdx,
     return 0 != SetThreadGroupAffinity(GetCurrentThread(), &group, NULL);
 }
 bool pin_current_thread_by_mask(int ncores, const CpuSet& procMask) {
-    return false;
+    GROUP_AFFINITY group;
+    group.Group = 0;
+    group.Mask = DWORD_PTR(0);
+    group.Reserved[0] = 0;
+    group.Reserved[1] = 0;
+    group.Reserved[2] = 0;
+    return 0 != SetThreadGroupAffinity(GetCurrentThread(), &group, NULL);
 }
 bool pin_current_thread_to_socket(int socket) {
     return false;
