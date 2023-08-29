@@ -11,13 +11,21 @@
 #if !(defined(__APPLE__) || defined(__EMSCRIPTEN__) || defined(_WIN32))
 #    include <sched.h>
 #endif
+#if defined(_WIN32)
+#    include <windows.h>
+
+#    include <thread>
+#endif
 
 namespace ov {
 namespace threading {
 
-#if (defined(__APPLE__) || defined(__EMSCRIPTEN__) || defined(_WIN32))
+#if (defined(__APPLE__) || defined(__EMSCRIPTEN__))
 using cpu_set_t = void;
-#endif  // (defined(__APPLE__) || defined(__EMSCRIPTEN__) || defined(_WIN32))
+#endif  // (defined(__APPLE__) || defined(__EMSCRIPTEN__))
+#if defined(_WIN32)
+using cpu_set_t = KAFFINITY;
+#endif  // defined(_WIN32)
 
 /**
  * @brief      Release the cores affinity mask for the current process
@@ -53,7 +61,7 @@ using CpuSet = std::unique_ptr<cpu_set_t, ReleaseProcessMaskDeleter>;
  * @ingroup ov_dev_api_threading
  * @return A core affinity mask
  */
-std::tuple<CpuSet, int> get_process_mask();
+std::tuple<CpuSet, int, int> get_process_mask();
 
 /**
  * @brief      Pins current thread to a set of cores determined by the mask
@@ -80,9 +88,10 @@ bool pin_thread_to_vacant_core(int thrIdx,
  *
  * @param[in]  ncores       The ncores
  * @param[in]  processMask  The process mask
+ * @param[in]  numaNodeId   numa node id
  * @return     `True` in case of success, `false` otherwise
  */
-bool pin_current_thread_by_mask(int ncores, const CpuSet& processMask);
+bool pin_current_thread_by_mask(int ncores, const CpuSet& processMask, int numaNodeId = 0);
 
 /**
  * @brief      Pins a current thread to a socket.

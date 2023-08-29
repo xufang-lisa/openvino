@@ -34,6 +34,7 @@ struct CPUStreamsExecutor::Impl {
             int _offset = 0;
             int _cpuIdxOffset = 0;
             int _numanodeId = 0;
+            int _preNumaId = 0;
             std::vector<int> _cpu_ids;
             Observer(custom::task_arena& arena,
                      CpuSet mask,
@@ -44,6 +45,7 @@ struct CPUStreamsExecutor::Impl {
                      const int threadBindingOffset,
                      const int cpuIdxOffset = 0,
                      const int numaNodeId = 0,
+                     const int preNumaId = 0,
                      const std::vector<int> cpu_ids = {})
                 : custom::task_scheduler_observer(arena),
                   _mask{std::move(mask)},
@@ -52,6 +54,7 @@ struct CPUStreamsExecutor::Impl {
                   _offset{streamId * threadsPerStream + threadBindingOffset},
                   _cpuIdxOffset(cpuIdxOffset),
                   _numanodeId(numaNodeId),
+                  _preNumaId(preNumaId),
                   _cpu_ids(cpu_ids) {}
             void on_scheduler_entry(bool) override {
                 pin_thread_to_vacant_core(_offset + tbb::this_task_arena::current_thread_index(),
@@ -63,7 +66,7 @@ struct CPUStreamsExecutor::Impl {
                                           _numanodeId);
             }
             void on_scheduler_exit(bool) override {
-                pin_current_thread_by_mask(_ncpus, _mask);
+                pin_current_thread_by_mask(_ncpus, _mask, _preNumaId);
             }
             ~Observer() override = default;
         };
@@ -168,18 +171,22 @@ struct CPUStreamsExecutor::Impl {
                 if (_cpu_ids.size() > 0) {
                     CpuSet processMask;
                     int ncpus = 0;
-                    std::tie(processMask, ncpus) = get_process_mask();
-                    _observer.reset(new Observer{*_taskArena,
-                                                 std::move(processMask),
-                                                 ncpus,
-                                                 0,
-                                                 concurrency,
-                                                 0,
-                                                 0,
-                                                 0,
-                                                 _numaNodeId,
-                                                 _cpu_ids});
-                    _observer->observe(true);
+                    int preNumaId = 0;
+                    std::tie(processMask, ncpus, preNumaId) = get_process_mask();
+                    if (nullptr != processMask) {
+                        _observer.reset(new Observer{*_taskArena,
+                                                     std::move(processMask),
+                                                     ncpus,
+                                                     0,
+                                                     concurrency,
+                                                     0,
+                                                     0,
+                                                     0,
+                                                     _numaNodeId,
+                                                     preNumaId,
+                                                     _cpu_ids});
+                        _observer->observe(true);
+                    }
                 }
             }
         }
@@ -282,7 +289,8 @@ struct CPUStreamsExecutor::Impl {
 #    endif
                     CpuSet processMask;
                     int ncpus = 0;
-                    std::tie(processMask, ncpus) = get_process_mask();
+                    int numaId = 0;
+                    std::tie(processMask, ncpus, numaId) = get_process_mask();
                     if (nullptr != processMask) {
                         _observer.reset(new Observer{*_taskArena,
                                                      std::move(processMask),
@@ -303,7 +311,8 @@ struct CPUStreamsExecutor::Impl {
                 if (ThreadBindingType::CORES == _impl->_config._threadBindingType) {
                     CpuSet processMask;
                     int ncpus = 0;
-                    std::tie(processMask, ncpus) = get_process_mask();
+                    int numaId = 0;
+                    std::tie(processMask, ncpus, numaId) = get_process_mask();
                     if (nullptr != processMask) {
                         _observer.reset(new Observer{*_taskArena,
                                                      std::move(processMask),
