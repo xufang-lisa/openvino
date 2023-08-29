@@ -112,7 +112,7 @@ bool pin_current_thread_to_socket(int socket) {
     }
     return res;
 }
-#else   // no threads pinning/binding on Win/MacOS
+#else  // no threads pinning/binding on MacOS
 #    if defined(_WIN32)
 std::tuple<CpuSet, int, int> get_process_mask() {
     GROUP_AFFINITY group;
