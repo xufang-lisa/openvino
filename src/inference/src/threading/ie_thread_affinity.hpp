@@ -36,7 +36,7 @@ using CpuSet = ov::threading::CpuSet;
  * @ingroup ie_dev_api_threading
  * @return A core affinity mask
  */
-std::tuple<CpuSet, int> GetProcessMask();
+std::tuple<CpuSet, int, int> GetProcessMask();
 
 /**
  * @brief      Pins current thread to a set of cores determined by the mask

@@ -8,7 +8,7 @@
 
 namespace InferenceEngine {
 
-std::tuple<CpuSet, int> GetProcessMask() {
+std::tuple<CpuSet, int, int> GetProcessMask() {
     return ov::threading::get_process_mask();
 }
 

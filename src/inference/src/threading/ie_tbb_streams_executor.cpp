@@ -47,6 +47,7 @@ struct TBBStreamsExecutor::Impl {
             int _ncpus = 0;
             int _threadBindingStep = 0;
             int _offset = 0;
+            int _numaId = 0;
 
             Observer(custom::task_arena& arena,
                      Stream* thisStream,
@@ -62,7 +63,7 @@ struct TBBStreamsExecutor::Impl {
                   _threadBindingStep{threadBindingStep},
                   _offset{streamId * threadsPerStream + threadBindingOffset} {
                 if (pinToCores) {
-                    std::tie(_mask, _ncpus) = GetProcessMask();
+                    std::tie(_mask, _ncpus, _numaId) = GetProcessMask();
                 }
             }
             void on_scheduler_entry(bool) override {

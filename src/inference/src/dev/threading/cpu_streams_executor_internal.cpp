@@ -51,7 +51,7 @@ void get_cur_stream_info(const int stream_id,
         max_threads_per_core = 2;
     }
 
-#if defined(_WIN32) || defined(__APPLE__)
+#if defined(__APPLE__)
     cpu_reserve = false;
 #endif
     if (cpu_reserve) {
@@ -80,6 +80,11 @@ void reserve_cpu_by_streams_info(const std::vector<std::vector<int>> _streams_in
     int num_conditions = 0;
     int condition_idx = 0;
     bool last_all_proc = false;
+    int cores_per_numa = static_cast<int>(_cpu_mapping_table.size());
+#if defined(_WIN32)
+    cores_per_numa = _numa_nodes > 0 ? static_cast<int>(_cpu_mapping_table.size() / _numa_nodes)
+                                     : static_cast<int>(_cpu_mapping_table.size());
+#endif
 
     for (size_t i = 0; i < _streams_info_table.size(); i++) {
         if (_streams_info_table[i][NUMBER_OF_STREAMS] > 0) {
@@ -133,7 +138,10 @@ void reserve_cpu_by_streams_info(const std::vector<std::vector<int>> _streams_in
         for (size_t j = 0; j < stream_conditions.size(); j++) {
             if (std::find(stream_conditions[j].begin(), stream_conditions[j].end(), cpu_string) !=
                 stream_conditions[j].end()) {
-                _stream_processors[stream_pos[j]].push_back(_cpu_mapping_table[i][CPU_MAP_PROCESSOR_ID]);
+                int id = _cpu_mapping_table[i][CPU_MAP_PROCESSOR_ID] < cores_per_numa
+                             ? _cpu_mapping_table[i][CPU_MAP_PROCESSOR_ID]
+                             : _cpu_mapping_table[i][CPU_MAP_PROCESSOR_ID] % cores_per_numa;
+                _stream_processors[stream_pos[j]].push_back(id);
                 _cpu_mapping_table[i][CPU_MAP_USED_FLAG] = _cpu_status;
                 if (static_cast<int>(_stream_processors[stream_pos[j]].size()) ==
                     streams_table[j][THREADS_PER_STREAM]) {
