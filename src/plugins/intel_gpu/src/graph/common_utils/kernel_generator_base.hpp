@@ -29,7 +29,9 @@ using cldnn::WeightsReorderParams;
 using KernelLanguage = cldnn::kernel_language;
 
 struct KernelData;
-struct ImplRuntimeParams {};
+struct ImplRuntimeParams {
+    virtual ~ImplRuntimeParams() = default;
+};
 
 struct DispatchDataFunc {
     using FuncType = std::function<void(const RuntimeParams&, KernelData&, ImplRuntimeParams*)>;
