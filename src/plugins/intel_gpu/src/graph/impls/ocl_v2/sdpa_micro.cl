@@ -201,6 +201,7 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
 #endif
     const int d = HEAD_SIZE;
 #if IS_GQA_SINGLE_TOKEN
+    const int seq_tokens = q;
     q *= KV_GROUP_SIZE;
 #endif
 #endif
@@ -214,13 +215,24 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
 #endif
 
 #if IS_PAGED_ATTENTION
+    #if IS_GQA_MIXED
+    uint wg_j0 = subsequence_query_block_idx * KV_GROUP_SIZE;
+    #else
     uint wg_j0 = subsequence_query_block_idx;
+    #endif
 #else
     uint wg_j0 = get_group_id(0) * ugemm_kq_wg_tile_n;
 #endif
     /* Leading dimension for matrices */
 #if IS_PAGED_ATTENTION
-    #if IS_GQA_SINGLE_TOKEN
+    #if IS_GQA_MIXED
+        // MIXED GQA: token stride in global memory (between consecutive tokens)
+        uint ldq_token = HEAD_SIZE * HEADS_NUM * KV_GROUP_SIZE + INPUT0_PAD_BEFORE_FEATURE_NUM + INPUT0_PAD_AFTER_FEATURE_NUM;
+        uint lda_token = HEAD_SIZE * HEADS_NUM * KV_GROUP_SIZE;
+        // Within-token stride between consecutive GQA heads
+        uint ldq = HEAD_SIZE;
+        uint lda = HEAD_SIZE;
+    #elif IS_GQA_SINGLE_TOKEN
         uint ldq = HEAD_SIZE + INPUT0_PAD_BEFORE_FEATURE_NUM + INPUT0_PAD_AFTER_FEATURE_NUM;
         uint lda = HEAD_SIZE;
     #else
@@ -234,11 +246,11 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
         #if IS_INT4_KV_CACHE
         // INT4 K BY_CHANNEL Layout::N: ldk = column stride in u4 elements.
         // ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE is in bytes (packed_block + scale = 12).
-        // Multiply by 2 for u4: 12 * 2 = 24 u4 elements → 12 byte stride.
+        // Multiply by 2 for u4: 12 * 2 = 24 u4 elements = 12 byte stride.
         uint ldk = ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE * 2;
         // INT4 V per-token Layout::N: ldv = row stride in u4 elements.
         // ADJUSTED_V_HEAD_SIZE is in bytes (packed_head + scale = 68).
-        // Multiply by 2 for u4: 68 * 2 = 136 u4 elements → 68 byte stride.
+        // Multiply by 2 for u4: 68 * 2 = 136 u4 elements = 68 byte stride.
         uint ldv = ADJUSTED_V_HEAD_SIZE * 2;
         #else
         uint ldk = ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE;
@@ -307,7 +319,12 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
 
     /* Locate K/Q/V/A matrices within batch */
 #if IS_PAGED_ATTENTION
-    #if IS_GQA_SINGLE_TOKEN
+    #if IS_GQA_MIXED
+        Q += subsequence_begin * ldq_token
+           + b0 * HEAD_SIZE * KV_GROUP_SIZE + INPUT0_PAD_BEFORE_FEATURE_NUM;
+        A += subsequence_begin * lda_token
+           + b0 * HEAD_SIZE * KV_GROUP_SIZE;
+    #elif IS_GQA_SINGLE_TOKEN
         Q += subsequence_begin * ldq * HEADS_NUM * KV_GROUP_SIZE
            + b0 * HEAD_SIZE * KV_GROUP_SIZE + INPUT0_PAD_BEFORE_FEATURE_NUM;
         A += subsequence_begin * lda * HEADS_NUM * KV_GROUP_SIZE
@@ -371,7 +388,34 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
     /* Load Q tile, destined for SLM */
     q_tile_type Q_tile;
     uint q0_copy = q_tile_sg_n * sg_ij;
-#ifdef BLOCK_Q
+#if IS_GQA_MIXED
+    // GQA MIXED: Q data is not contiguous in column direction.
+    // Column j in the logical Q matrix maps to:
+    //   token_in_seq = j / KV_GROUP_SIZE
+    //   head_in_group = j % KV_GROUP_SIZE
+    //   global offset from Q base = token_in_seq * ldq_token + head_in_group * HEAD_SIZE
+    {
+        const uint sg_col_start = wg_j0 + q0_copy;
+        const uint lid = get_sub_group_local_id();
+        for (uint col = 0; col < q_tile_sg_n; col++) {
+            uint j = sg_col_start + col;
+            if (j < (uint)q) {
+                uint token_idx = j / KV_GROUP_SIZE;
+                uint head_idx = j % KV_GROUP_SIZE;
+                const global uint *Q_col = (const global uint *)(Q + token_idx * ldq_token + head_idx * HEAD_SIZE);
+                Q_tile.x[col].s0 = Q_col[lid];
+                Q_tile.x[col].s1 = Q_col[16 + lid];
+                Q_tile.x[col].s2 = Q_col[32 + lid];
+                Q_tile.x[col].s3 = Q_col[48 + lid];
+            } else {
+                Q_tile.x[col].s0 = 0;
+                Q_tile.x[col].s1 = 0;
+                Q_tile.x[col].s2 = 0;
+                Q_tile.x[col].s3 = 0;
+            }
+        }
+    }
+#elif defined(BLOCK_Q)
     tile_load_block_rem_q(
             &Q_tile, (global uint *)Q, q, ldq >> 1, 0, wg_j0 + q0_copy);
 #elif Q_ALIGN >= 4
@@ -533,7 +577,7 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
 
         /* Calculate S = (K^T) * Q */
 #if IS_PAGED_ATTENTION && !IS_PREFILL
-    #if !IS_GQA_SINGLE_TOKEN
+    #if !IS_GQA_SINGLE_TOKEN || IS_GQA_MIXED
         s_tile_type S_tile;
         tile_fill(S_tile, 0.0f);
 
@@ -564,7 +608,7 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
                 #endif
             #endif
 
-        #if IS_GQA_SINGLE_TOKEN
+        #if IS_GQA_SINGLE_TOKEN && !IS_GQA_MIXED
             s_tile_type S_tile =
         #else
             s_tile_type S_tile1 =
@@ -575,7 +619,7 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
                            , (global half *)K0_scales, (global half *)K0_zp, ldkq
             #endif
                     );
-    #if !IS_GQA_SINGLE_TOKEN
+    #if !IS_GQA_SINGLE_TOKEN || IS_GQA_MIXED
             tile_binary(S_tile, S_tile1, binary_add);
             break;
         }
@@ -645,18 +689,36 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
                              
         int col_offset = wg_j0 + sg_j0_kq;
     #if IS_PAGED_ATTENTION && !IS_PREFILL
-        #if IS_GQA_SINGLE_TOKEN
+        #if IS_GQA_MIXED
+            // GQA MIXED: column j has query position = past_len + j / KV_GROUP_SIZE
+            // Use custom mask: for each (k_row, q_col), mask if k_pos > past_len + q_col/KV_GROUP_SIZE
+            {
+                for (int j = 0; j < (ugemm_kq_c_type_block1 * ugemm_kq_c_type_nblock1); j++) {
+                    for (int i0 = 0; i0 < (ugemm_kq_c_type_block0 * ugemm_kq_c_type_nblock0); i0 += SUBGROUP_SIZE) {
+                        int k_pos = k0 + sg_i0_kq + j;
+                        int q_col = col_offset + i0 + get_sub_group_local_id();
+                        int q_pos = past_len + q_col / KV_GROUP_SIZE;
+                        if (greater_than(k_pos, q_pos)) {
+                            tile_access(S_tile, i0, j, SUBGROUP_SIZE, ugemm_kq_c_type_block0,
+                                    ugemm_kq_c_type_block1, ugemm_kq_c_type_nblock0) = -FLT_MAX;
+                        }
+                    }
+                }
+            }
+        #elif IS_GQA_SINGLE_TOKEN
             col_offset += k - 1 - get_sub_group_local_id();
         #else
             col_offset += k - q;
         #endif
     #endif
 
+    #if !IS_GQA_MIXED || !(IS_PAGED_ATTENTION && !IS_PREFILL)
         /* Apply causal mask */
         tile_predicated_assignment_t(S_tile, k0 + sg_i0_kq, col_offset,
                 greater_than, -FLT_MAX, SUBGROUP_SIZE, ugemm_kq_c_type_block0,
                 ugemm_kq_c_type_block1, ugemm_kq_c_type_nblock0,
                 ugemm_kq_c_type_nblock1);
+    #endif
 #endif
 
 #if HAS_QQ_BIAS && IS_PAGED_ATTENTION && (IS_PREFILL == 0)
@@ -923,7 +985,7 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
 #if IS_PAGED_ATTENTION && !IS_PREFILL
         int kb0 = 0;
         for (; kb0 < k_chunk; kb0 += PAGED_ATTENTION_BLOCK_SIZE) {
-            #if !IS_GQA_SINGLE_TOKEN
+            #if !IS_GQA_SINGLE_TOKEN || IS_GQA_MIXED
                 if ((k0 + kb0) >= past_lens[gws_mapping]) {
                     break;
                 }
@@ -945,9 +1007,9 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
             #endif
 
             a_tile_type A_tile1 = ugemm_vs(
-                    Vb0, ldv, Sb0, ugemm_kq_wg_tile_m, 
-                    d, ugemm_kq_wg_tile_n, kb_chunk, 
-                    0, 0, 0, 
+                    Vb0, ldv, Sb0, ugemm_kq_wg_tile_m,
+                    d, ugemm_kq_wg_tile_n, kb_chunk,
+                    0, 0, 0,
                     sg_i_vs, sg_j_vs, (local char *)ugemm_slm
                 #if IS_KV_COMPRESSED_PA
                     , (global half *)Vb0_scales, (global half *)Vb0_zp, ldvq
@@ -956,7 +1018,7 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
 
             tile_binary(A_tile, A_tile1, binary_add);
         }
-    #if !IS_GQA_SINGLE_TOKEN
+    #if !IS_GQA_SINGLE_TOKEN || IS_GQA_MIXED
         for (; kb0 < k_chunk; kb0 += k_chunk) {
             global QRY_DATA_T *Vb0 = Vc + ldvc * (k0 + kb0 - past_lens[gws_mapping]);
             uint s_block_num = kb0 / PAGED_ATTENTION_BLOCK_SIZE;
@@ -1036,7 +1098,30 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
     uint sg_i0_vs = sg_i_vs * ugemm_vs_sg_tile_m;
     uint sg_j0_vs = sg_j_vs * ugemm_vs_sg_tile_n + wg_j0;
 
-#ifdef BLOCK_2D_A
+#if IS_GQA_MIXED
+    // GQA MIXED: scatter A_tile directly to non-contiguous global memory.
+    // Each SG covers rows [sg_i0_vs, sg_i0_vs + ugemm_vs_sg_tile_m) and all wg columns.
+    // A_tile_half layout: br=ugemm_vs_sg_tile_m, bc=8, nbr=1, nbc=ugemm_vs_sg_tile_n/8
+    {
+        const uint lid = get_sub_group_local_id();
+        const uint col_start = sg_j0_vs - wg_j0;
+        for (uint j = 0; j < ugemm_vs_sg_tile_n && (col_start + j) < (uint)q; j++) {
+            uint col = col_start + j;
+            uint token_idx = col / KV_GROUP_SIZE;
+            uint head_idx = col % KV_GROUP_SIZE;
+            global half *A_dst = A + token_idx * lda_token + head_idx * HEAD_SIZE + sg_i0_vs;
+            // Each lane owns rows: lid, lid+SUBGROUP_SIZE within the sg tile
+            for (uint r = 0; r < ugemm_vs_sg_tile_m; r += SUBGROUP_SIZE) {
+                uint row = r + lid;
+                if (sg_i0_vs + row < (uint)d) {
+                    half val = tile_access(A_tile_half, r, j, SUBGROUP_SIZE,
+                            ugemm_vs_sg_tile_m, 8, 1);
+                    A_dst[row] = val;
+                }
+            }
+        }
+    }
+#elif defined(BLOCK_2D_A)
     tile_store_block2d(A_tile_half, A, d, q, lda, sg_i0_vs, sg_j0_vs);
 #elif defined(BLOCK_A)
     tile_store_block_rem_q(A_tile_half, A, q, lda, sg_i0_vs, sg_j0_vs);

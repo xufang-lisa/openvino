@@ -22,16 +22,18 @@ namespace ov::intel_gpu::ocl {
 #ifdef ENABLE_ONEDNN_FOR_GPU
 class SDPAMicroGenerator : public SDPABase {
 public:
-    explicit SDPAMicroGenerator(bool prefill, bool gqa_single_token = false)
+    explicit SDPAMicroGenerator(bool prefill, bool gqa_single_token = false, bool gqa_mixed = false)
         : SDPABase("sdpa_micro",
-                   prefill            ? "_prefill"
+                   prefill        ? "_prefill"
+                   : gqa_mixed    ? "_gqa_mixed"
                    : gqa_single_token ? "_gqa_single_token"
                                       : "_generate",
                    false),
           m_is_prefill(prefill),
-          m_is_gqa_single_token(gqa_single_token) {
-        if (gqa_single_token)
-            OPENVINO_ASSERT(prefill == false, "prefill should be false when gqa_single_token is true");
+          m_is_gqa_single_token(gqa_single_token || gqa_mixed),
+          m_is_gqa_mixed(gqa_mixed) {
+        if (gqa_single_token || gqa_mixed)
+            OPENVINO_ASSERT(prefill == false, "prefill should be false when gqa_single_token/gqa_mixed is true");
     }
 
     [[nodiscard]] std::string get_build_options(const kernel_impl_params& params) const override;
@@ -56,11 +58,13 @@ private:
                                   micro::Package& gemm_kcq,
                                   micro::Package& gemm_vcs,
                                   bool is_prefill,
-                                  bool is_gqa_single_token);
+                                  bool is_gqa_single_token,
+                                  bool is_gqa_mixed);
     static void init_sdpa_configuration(const kernel_impl_params& params, sdpa_configuration& config);
 
     bool m_is_prefill;
     bool m_is_gqa_single_token;
+    bool m_is_gqa_mixed;
     static std::mutex m;
 
     static constexpr size_t kq_id = 0;

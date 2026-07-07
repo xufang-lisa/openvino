@@ -406,6 +406,9 @@ sdpa_config_t xehpc_q_h512_s512_2nd = {16, 16, 64, 16, 8, 2, 8, 2};
 sdpa_config_t xehpc_q_h512_s1024_2nd = {64, 16, 64, 16, 16, 2, 16, 2};
 sdpa_config_t xehpc_q_h512_2nd = {16, 16, 64, 16, 16, 2, 16, 2};
 
+sdpa_config_t xe2_h128_pa = {16, 16, 16, 16, 8, 1, 8, 1};
+sdpa_config_t xe2_h128_pa_gqa_mixed = {16, 16, 16, 16, 8, 2, 8, 2};
+
 sdpa_config_t xe2_q_h64 = {16, 64, 16, 32, 16, 1, 8, 2};
 sdpa_config_t xe2_q_h64_s1024_integrated = {16, 64, 16, 32, 8, 4, 4, 8};
 sdpa_config_t xe2_q_h64_s512 = {16, 64, 16, 32, 8, 4, 4, 8};
@@ -713,6 +716,11 @@ sdpa_config_t* choose_config_xehpc(int head_size, int seq, bool thin_q, bool qua
 
 sdpa_config_t* choose_config_xe2(int head_size, int seq, bool thin_q, bool quantized, bool is_integrated, bool is_pa, bool is_prefill) {
     if (seq <= 0 && is_pa) {
+        if (head_size <= 128 && !is_prefill) {
+            if (thin_q)
+                return &xe2_h128_pa_gqa_mixed;
+            return &xe2_h128_pa;
+        }
         return choose_config_xehpc(head_size, seq, thin_q, quantized, is_integrated, is_pa, is_prefill);
     }
     if (head_size <= 64) {
@@ -901,7 +909,7 @@ KernelData SDPAMicroGenerator::get_kernel_data(const kernel_impl_params& params)
     std::vector<micro::Package> gemms(4);  // KQ, VS, KcQ and VcS
     sdpa_configuration sdpa_config;
     init_sdpa_configuration(params, sdpa_config);
-    init_microkernels(params, sdpa_config, gemms[kq_id], gemms[vs_id], gemms[kcq_id], gemms[vcs_id], m_is_prefill, m_is_gqa_single_token);
+    init_microkernels(params, sdpa_config, gemms[kq_id], gemms[vs_id], gemms[kcq_id], gemms[vcs_id], m_is_prefill, m_is_gqa_single_token, m_is_gqa_mixed);
 
     const auto& device_info = params.get_device_info();
     auto jit = get_jit_constants(params, gemms[kq_id], gemms[vs_id]);
@@ -944,7 +952,7 @@ KernelData SDPAMicroGenerator::get_kernel_data(const kernel_impl_params& params)
     kd.micro_kernels.push_back(std::make_shared<micro::MicroKernelPackage>(gemms[kq_id]));
     kd.micro_kernels.push_back(std::make_shared<micro::MicroKernelPackage>(gemms[vs_id]));
 
-    if (!m_is_prefill && !m_is_gqa_single_token) {
+    if (!m_is_prefill && (!m_is_gqa_single_token || m_is_gqa_mixed)) {
         shim_options.microkernelID++;
         shim_options.decorator = "kcq";
         kd.code->jit += generateShim(gemms[kcq_id], micro::HostLanguage::OpenCL_C, shim_options);
@@ -1090,6 +1098,7 @@ JitConstants SDPAMicroGenerator::get_jit_constants(const kernel_impl_params& par
 
     jit.make("IS_PREFILL", m_is_prefill);
     jit.make("IS_GQA_SINGLE_TOKEN", m_is_gqa_single_token);
+    jit.make("IS_GQA_MIXED", m_is_gqa_mixed);
     jit.make("TRANSPOSE_K", false);
     jit.make("IS_PAGED_ATTENTION", config.is_paged_attention ? 1 : 0);
     jit.make("KV_HEADS_NUM", config.kv_heads_num);
@@ -1422,20 +1431,46 @@ DispatchDataFunc SDPAMicroGenerator::get_dispatch_data_func() const {
 
             if (params.is_type<paged_attention>()) {
                 auto pa_rt_params = static_cast<PagedAttentionRuntimeParams*>(rt_params);
-                if (pa_rt_params->stage == PagedAttentionStage::GENERATE)
+                if (pa_rt_params && (pa_rt_params->stage == PagedAttentionStage::GENERATE ||
+                    pa_rt_params->stage == PagedAttentionStage::MIXED))
                     head_num = micro_get_num_heads(params, 1);
             }
 
             auto wg_tile_q = gemm_kq.getSetting("wg_tile_n");
             auto sg_per_wg = gemm_kq.getSetting("sg_per_wg_m") * gemm_kq.getSetting("sg_per_wg_n");
 
+            // For GQA MIXED, the mapping buffer splits by tokens (not expanded Q columns),
+            // so alignment block size = wg_tile_q / kv_group_size.
+            auto alignment_block_size = wg_tile_q;
+            if (params.is_type<paged_attention>()) {
+                auto pa_rt_params = static_cast<PagedAttentionRuntimeParams*>(rt_params);
+                if (pa_rt_params && pa_rt_params->stage == PagedAttentionStage::MIXED) {
+                    const auto desc = params.typed_desc<paged_attention>();
+                    if (desc->kv_heads_num > 0) {
+                        size_t kv_group_size = desc->heads_num / desc->kv_heads_num;
+                        if (kv_group_size > 1)
+                            alignment_block_size = wg_tile_q / static_cast<int64_t>(kv_group_size);
+                    }
+                }
+            }
+
             const ov::Dimension n_keys = micro_get_aligned_seq_length(params, 1, wg_tile_q);
-            const ov::Dimension n_queries = micro_get_aligned_seq_length(params, 0, wg_tile_q);
+            const ov::Dimension n_queries = micro_get_aligned_seq_length(params, 0, alignment_block_size);
+
+            GPU_DEBUG_TRACE_DETAIL << "sdpa_micro dispatch input: wg_tile_q=" << wg_tile_q
+                                   << ", alignment_block_size=" << alignment_block_size
+                                   << ", sg_per_wg=" << sg_per_wg
+                                   << ", n_queries=" << n_queries.to_string()
+                                   << ", n_keys=" << n_keys.to_string()
+                                   << ", head_num=" << head_num
+                                   << std::endl;
 
             wgs.local = {get_subgroup_size(device_info.arch), (size_t)sg_per_wg, 1};
             wgs.global = wgs.local;
 
-            wgs.global[0] *= ceil_div(n_queries.get_length(), wg_tile_q);
+            const auto query_blocks = ceil_div(n_queries.get_length(), alignment_block_size);
+            wgs.global[0] *= query_blocks;
+
             if (params.is_type<paged_attention>()) {
                 wgs.global[1] *= head_num;
                 wgs.global[2] *= 1;
@@ -1482,7 +1517,8 @@ void SDPAMicroGenerator::init_microkernels(const kernel_impl_params& params,
                                            micro::Package& gemm_kcq,
                                            micro::Package& gemm_vcs,
                                            bool is_prefill,
-                                           bool is_gqa_single_token) {
+                                           bool is_gqa_single_token,
+                                           bool is_gqa_mixed) {
     // TODO: Remove once micro API is thread safe
     std::lock_guard<std::mutex> l(m);
 
@@ -1694,7 +1730,7 @@ void SDPAMicroGenerator::init_microkernels(const kernel_impl_params& params,
         throw;
     }
 
-    if (!is_prefill && !is_gqa_single_token) {
+    if (!is_prefill && (!is_gqa_single_token || is_gqa_mixed)) {
         /* Update for optional GEMM: Kc*Q */
         opts_kq.scaleA = false;
         opts_kq.offsetA = false;
@@ -1829,7 +1865,7 @@ void SDPAMicroGenerator::init_microkernels(const kernel_impl_params& params,
         throw;
     }
 
-    if (!is_prefill && !is_gqa_single_token) {
+    if (!is_prefill && (!is_gqa_single_token || is_gqa_mixed)) {
         /* Update for optional GEMM: Vc*S */
         opts_vs.scaleA = false;
         opts_vs.offsetA = false;

@@ -1300,7 +1300,7 @@ public:
     Stage::Ptr pa_diversity_calc = make_stage<AdaptiveRKVDiversityGenerator>();
 #ifdef ENABLE_ONEDNN_FOR_GPU
     Stage::Ptr pa_sdpa_micro = make_stage<SDPAMicroGenerator>(true);
-    Stage::Ptr pa_sdpa_micro_mixed = make_stage<SDPAMicroGenerator>(false);
+    Stage::Ptr pa_sdpa_micro_mixed = make_stage<SDPAMicroGenerator>(false, false, true);
 #endif
 
     PagedAttentionOptImpl() : SDPAImplBase(PagedAttentionOpt::get_type_info_static()) {}
@@ -1344,7 +1344,7 @@ public:
         if (stage == PagedAttentionStage::PREFILL)
             return pa_sdpa_micro->kd.micro_kernels.size() > 0;
         else if (stage == PagedAttentionStage::MIXED)
-            return pa_sdpa_micro_mixed->kd.micro_kernels.size() > 0;
+            return pa_sdpa_micro_mixed && pa_sdpa_micro_mixed->kd.micro_kernels.size() > 0;
         return false;
     }
 
@@ -1402,18 +1402,22 @@ public:
         return wg_tile_q;
     }
 
-    size_t get_query_block_size(const PagedAttentionStage& stage, const bool use_micro_sdpa) const {
+    size_t get_query_block_size(const PagedAttentionStage& stage, const bool use_micro_sdpa, size_t kv_group_size = 1) const {
         const auto default_block_size = 16;
         if (use_micro_sdpa) {
             if (stage == PagedAttentionStage::PREFILL)
                 return get_micro_tile_qsize(pa_sdpa_micro->kd);
-            else if (stage == PagedAttentionStage::MIXED)
-                return get_micro_tile_qsize(pa_sdpa_micro_mixed->kd);
+            else if (stage == PagedAttentionStage::MIXED) {
+                auto tile_q = get_micro_tile_qsize(pa_sdpa_micro_mixed->kd);
+                if (kv_group_size > 1)
+                    tile_q /= kv_group_size;
+                return tile_q;
+            }
         }
         return default_block_size;
     }
 #else
-    size_t get_query_block_size(const PagedAttentionStage& stage, const bool use_micro_sdpa) const {
+    size_t get_query_block_size(const PagedAttentionStage& stage, const bool use_micro_sdpa, size_t kv_group_size = 1) const {
         const auto default_block_size = 16;
         return default_block_size;
     }
@@ -1454,12 +1458,24 @@ public:
         }
 
 #ifdef ENABLE_ONEDNN_FOR_GPU
-        rt_params->use_micro_sdpa = supports_micro_sdpa(params) && valid_micro_stage(rt_params->stage) && desc->has_token_type_ids == false;
+        {
+            bool _sup = supports_micro_sdpa(params);
+            bool _valid = valid_micro_stage(rt_params->stage);
+            bool _no_tt = (desc->has_token_type_ids == false);
+            rt_params->use_micro_sdpa = _sup && _valid && _no_tt;
+        }
 #else
         rt_params->use_micro_sdpa = false;
 #endif
 
-        rt_params->query_block_size = get_query_block_size(rt_params->stage, rt_params->use_micro_sdpa);
+        const size_t kv_group_size = (desc->kv_heads_num > 0) ? desc->heads_num / desc->kv_heads_num : 1;
+        rt_params->query_block_size = get_query_block_size(rt_params->stage, rt_params->use_micro_sdpa, kv_group_size);
+
+    GPU_DEBUG_TRACE_DETAIL << "paged_attention update_stages_flags: stage=" << static_cast<size_t>(rt_params->stage)
+                   << ", initial_use_micro_sdpa=" << rt_params->use_micro_sdpa
+                   << ", query_block_size=" << rt_params->query_block_size
+                   << ", has_sink_input=" << desc->has_sink_input
+                   << std::endl;
 
         if (rt_params->stage == PagedAttentionStage::GENERATE) {
             rt_params->use_micro_sdpa = false;
@@ -1471,6 +1487,13 @@ public:
         } else {
             rt_params->use_gqa_kernel = false;
         }
+
+        GPU_DEBUG_TRACE_DETAIL << "paged_attention update_stages_flags final: stage=" << static_cast<size_t>(rt_params->stage)
+                               << ", use_micro_sdpa=" << rt_params->use_micro_sdpa
+                               << ", use_gqa_kernel=" << rt_params->use_gqa_kernel
+                               << ", num_of_partitions=" << rt_params->num_of_partitions
+                               << ", max_context_len=" << rt_params->max_context_len
+                               << std::endl;
         return;
     }
 
@@ -1488,10 +1511,18 @@ public:
         const bool has_adaptive_rkv = desc->has_adaptive_rkv;
 
         update_stages_flags(instance);
+
         kernel_dump_info.clear_entries();
         auto rt_params = static_cast<PagedAttentionRuntimeParams*>(m_rt_params.get());
         assert(rt_params != nullptr);
         prepare_internal_buffers(static_cast<paged_attention_inst&>(instance), rt_params->stage, rt_params->use_micro_sdpa, rt_params->query_block_size);
+
+        GPU_DEBUG_TRACE_DETAIL << "paged_attention execute_impl: stage=" << static_cast<size_t>(rt_params->stage)
+                       << ", use_micro_sdpa=" << rt_params->use_micro_sdpa
+                       << ", use_gqa_kernel=" << rt_params->use_gqa_kernel
+                       << ", query_block_size=" << rt_params->query_block_size
+                       << ", num_of_partitions=" << rt_params->num_of_partitions
+                       << std::endl;
         std::vector<event::ptr> res_event = events;
         if (has_rotated_blocks) {
             const auto& rotated_block_indices_input = params.get_input_layout(PagedAttentionInputIdx::ROTATED_BLOCK_INDICES);
@@ -1503,25 +1534,41 @@ public:
 
         if (rt_params->stage == PagedAttentionStage::PREFILL) {
 #ifdef ENABLE_ONEDNN_FOR_GPU
-            if (rt_params->use_micro_sdpa)
+            if (rt_params->use_micro_sdpa) {
+                GPU_DEBUG_TRACE_DETAIL << "paged_attention execute_impl: entering pa_sdpa_micro" << std::endl;
                 res_event = {execute_stage(res_event, instance, pa_sdpa_micro)};
-            else
+            } else
 #endif
+            {
+                GPU_DEBUG_TRACE_DETAIL << "paged_attention execute_impl: entering pa_sdpa_opt" << std::endl;
                 res_event = {execute_stage(res_event, instance, pa_sdpa_opt)};
+            }
         } else if (rt_params->stage == PagedAttentionStage::GENERATE || rt_params->stage == PagedAttentionStage::MIXED) {
             const auto multi_tokens_mode = rt_params->stage == PagedAttentionStage::MIXED;
             auto num_of_partitions = rt_params->num_of_partitions;
             if (rt_params->use_gqa_kernel && !rt_params->use_micro_sdpa) {
+                GPU_DEBUG_TRACE_DETAIL << "paged_attention execute_impl: entering "
+                                       << (multi_tokens_mode ? "pa_multi_token" : "pa_gqa_single_token")
+                                       << " via gqa path" << std::endl;
                 res_event = {execute_stage(res_event, instance, multi_tokens_mode ? pa_multi_token : pa_gqa_single_token)};
             } else {
 #ifdef ENABLE_ONEDNN_FOR_GPU
-                if (multi_tokens_mode && rt_params->use_micro_sdpa)
+                if (multi_tokens_mode && rt_params->use_micro_sdpa) {
+                    GPU_DEBUG_TRACE_DETAIL << "paged_attention execute_impl: entering pa_sdpa_micro_mixed" << std::endl;
                     res_event = {execute_stage(res_event, instance, pa_sdpa_micro_mixed)};
-                else
+                } else
 #endif
+                {
+                    GPU_DEBUG_TRACE_DETAIL << "paged_attention execute_impl: entering "
+                                           << (multi_tokens_mode ? "pa_multi_token" : "pa_single_token")
+                                           << std::endl;
                     res_event = {execute_stage(res_event, instance, multi_tokens_mode ? pa_multi_token : pa_single_token)};
+                }
             }
             if (num_of_partitions > 1 && !rt_params->use_micro_sdpa) {
+                GPU_DEBUG_TRACE_DETAIL << "paged_attention execute_impl: entering finalization "
+                                       << (multi_tokens_mode ? "pa_multi_token_finalization" : "pa_single_token_finalization")
+                                       << std::endl;
                 res_event = {execute_stage(res_event, instance, multi_tokens_mode ? pa_multi_token_finalization : pa_single_token_finalization)};
             }
         }
@@ -1635,7 +1682,8 @@ public:
         GPU_DEBUG_TRACE_DETAIL << "get_internal_buffer_descs: stage = " << static_cast<size_t>(stage) << std::endl;
         int64_t paged_attention_aligned_seq_len = -1;
         if (!params.is_dynamic()) {
-            auto block_size = get_query_block_size(stage, can_use_micro_sdpa);
+            const size_t kv_group_size = (desc->kv_heads_num > 0) ? desc->heads_num / desc->kv_heads_num : 1;
+            auto block_size = get_query_block_size(stage, can_use_micro_sdpa, kv_group_size);
             paged_attention_aligned_seq_len = get_aligned_seq_len(params, stage, block_size);
         }
         const auto target_seq_len = std::max<int64_t>(paged_attention_aligned_seq_len, 1);
