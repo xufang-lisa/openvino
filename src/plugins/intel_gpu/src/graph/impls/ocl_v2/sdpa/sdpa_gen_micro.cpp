@@ -1457,14 +1457,6 @@ DispatchDataFunc SDPAMicroGenerator::get_dispatch_data_func() const {
             const ov::Dimension n_keys = micro_get_aligned_seq_length(params, 1, wg_tile_q);
             const ov::Dimension n_queries = micro_get_aligned_seq_length(params, 0, alignment_block_size);
 
-            GPU_DEBUG_TRACE_DETAIL << "sdpa_micro dispatch input: wg_tile_q=" << wg_tile_q
-                                   << ", alignment_block_size=" << alignment_block_size
-                                   << ", sg_per_wg=" << sg_per_wg
-                                   << ", n_queries=" << n_queries.to_string()
-                                   << ", n_keys=" << n_keys.to_string()
-                                   << ", head_num=" << head_num
-                                   << std::endl;
-
             wgs.local = {get_subgroup_size(device_info.arch), (size_t)sg_per_wg, 1};
             wgs.global = wgs.local;
 
