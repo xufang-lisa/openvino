@@ -1410,7 +1410,7 @@ public:
             else if (stage == PagedAttentionStage::MIXED) {
                 auto tile_q = get_micro_tile_qsize(pa_sdpa_micro_mixed->kd);
                 if (kv_group_size > 1)
-                    tile_q /= kv_group_size;
+                    tile_q = std::max<size_t>(1, tile_q / kv_group_size);
                 return tile_q;
             }
         }

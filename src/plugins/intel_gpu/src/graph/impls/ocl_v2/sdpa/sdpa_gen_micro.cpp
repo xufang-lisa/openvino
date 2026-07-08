@@ -1449,7 +1449,7 @@ DispatchDataFunc SDPAMicroGenerator::get_dispatch_data_func() const {
                     if (desc->kv_heads_num > 0) {
                         size_t kv_group_size = desc->heads_num / desc->kv_heads_num;
                         if (kv_group_size > 1)
-                            alignment_block_size = wg_tile_q / static_cast<int64_t>(kv_group_size);
+                            alignment_block_size = std::max<int64_t>(1, wg_tile_q / static_cast<int64_t>(kv_group_size));
                     }
                 }
             }
